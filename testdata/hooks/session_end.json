@@ -1,0 +1,9 @@
+{
+  "session_id": "298596c4-644f-4d09-bfe6-86fa76cf3ef1",
+  "transcript_path": "/home/jiisanda/.claude/projects/-home-jiisanda-projects-nod-scratch/298596c4-644f-4d09-bfe6-86fa76cf3ef1.jsonl",
+  "cwd": "/home/jiisanda/projects/nod/scratch",
+  "scratchpad_dir": "/tmp/claude-1000/-home-jiisanda-projects-nod-scratch/298596c4-644f-4d09-bfe6-86fa76cf3ef1/scratchpad",
+  "prompt_id": "0ae10271-c293-4550-8761-7f8cb4f502d4",
+  "hook_event_name": "SessionEnd",
+  "reason": "prompt_input_exit"
+}

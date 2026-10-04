@@ -1,0 +1,10 @@
+{
+  "session_id": "298596c4-644f-4d09-bfe6-86fa76cf3ef1",
+  "transcript_path": "/home/jiisanda/.claude/projects/-home-jiisanda-projects-nod-scratch/298596c4-644f-4d09-bfe6-86fa76cf3ef1.jsonl",
+  "cwd": "/home/jiisanda/projects/nod/scratch",
+  "scratchpad_dir": "/tmp/claude-1000/-home-jiisanda-projects-nod-scratch/298596c4-644f-4d09-bfe6-86fa76cf3ef1/scratchpad",
+  "prompt_id": "bc50aa0d-a20f-4730-acb5-67784042f1bd",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "run touch probe1.txt with bash"
+}
