@@ -8,8 +8,8 @@ Status per planning step:
 |---|---|---|
 | 1 | Goals and non-goals | decided |
 | 2 | Hooks contract check | decided (experiment run 2026-10-04; three small verify items left) |
-| 3 | Components and boundaries | open |
-| 4 | Data model | open |
+| 3 | Components and boundaries | decided |
+| 4 | Data model | decided |
 | 5 | Protocols | open |
 | 6 | Lifecycles and failure modes | open |
 | 7 | Security | open |
@@ -154,6 +154,151 @@ Safety property, confirmed by tests 4 and 5: a decision that arrives after the t
 
 ---
 
+## 3. Components and boundaries
+
+```
+ Claude Code ──stdin──▶ nod hook ──unix socket──▶ nod daemon ◀──D-Bus──┬─ GNOME extension
+                         (relay)                  (all logic)          ├─ nod status / approve / deny
+                                                                       └─ (future: KDE, waybar, tui)
+ nod install ──▶ ~/.claude/settings.json   (separate; never talks to the daemon)
+```
+
+Each component has one job and an explicit list of things it must never do.
+
+### `nod hook`: relay
+
+- **Owns:** reading stdin; reading `hook_event_name` (the only field it looks at) to decide whether to wait; forwarding the raw payload; for `PermissionRequest`, printing the decision it receives.
+- **Never:** keeps state, writes files, retries, logs to stdout, starts the daemon, interprets the payload beyond `hook_event_name`.
+- Any failure: exit 0, empty stdout.
+
+### `nod daemon`: all logic
+
+- **Owns:** session and approval state; pairing `PermissionRequest` with its `PreToolUse`; the approval lifetime rules (section 2); session expiry; coalescing state updates; formatting every string a frontend displays; the D-Bus API.
+- **Structure:** a pure core (`internal/state`) with no I/O: events, clicks and the current time go in, new state comes out. All the rules from the experiment live there and are unit-tested against `testdata/hooks/` without sockets or sleeps. A thin outer layer (`internal/daemon`, `internal/dbusapi`) does socket and D-Bus I/O. One goroutine owns the state; socket handlers and D-Bus methods send it messages, so events are processed strictly in order and there are no locks around state.
+- **Never:** makes a decision the user didn't click; reads transcripts; touches `settings.json`; executes anything.
+
+### Frontends (GNOME extension first)
+
+- **Owns:** rendering the snapshot, positioning, turning clicks into D-Bus calls.
+- **Never:** parses hook payloads, keeps its own model of sessions, does file I/O, runs timers other than UI animation.
+- The daemon pre-formats display text (activity summaries, labels, option labels), so all frontends show the same thing and contain no logic.
+
+### `nod status` / `nod approve` / `nod deny`
+
+A D-Bus client using the same public API as the extension. It is the first frontend and exercises the API before any UI exists.
+
+### `nod install` / `nod uninstall`
+
+- **Owns:** nod's entries in `~/.claude/settings.json`, with backup, diff and confirmation.
+- Independent of the daemon.
+
+### Decisions
+
+1. **The CLI talks D-Bus, not the socket.** One control API to build and secure. Consequence: CLAUDE.md milestones 2 and 3 merge, since D-Bus must exist before `nod approve` works. The unix socket carries only hook traffic.
+2. **nod never decides on its own.** No auto-allow rules inside nod. Standing permissions live in Claude Code's own rules, which "Allow and don't ask again" writes to. nod is a remote control, not a policy engine.
+3. **No persisted state.** On daemon restart, sessions reappear with their next event. Waiting hooks lose their connection and exit silently, so the terminal prompt still works.
+4. **The hook never starts the daemon.** systemd or XDG autostart starts it. If it isn't running, nod has no opinion and Claude Code behaves normally.
+
+---
+
+## 4. Data model
+
+### Internal state (daemon only)
+
+**Session**, keyed by `session_id`:
+
+| Field | Source |
+|---|---|
+| `label` | Basename of `cwd`, disambiguated (below) |
+| `cwd`, `permission_mode` | Latest event (mode can change mid-session) |
+| `base_state` | `idle` / `working` / `needs_input` / `done`, set by events |
+| `activity` | Tool + short summary (`Bash · touch probe2.txt`), or none |
+| `last_event_at` | Latest event; for the fallback expiry |
+| `claude_pid` | Parent PID reported by the hook; watched for exit (below) |
+| `recent_pre_tool_uses` | Small ring buffer of recent `PreToolUse` (tool name, input, `tool_use_id`), used only for pairing |
+
+**Approval**, one per pending `PermissionRequest`:
+
+| Field | Notes |
+|---|---|
+| `id` | Random 128-bit hex; what frontends send back |
+| `session_id`, `tool_use_id` | `tool_use_id` from pairing; may be empty if pairing fails (safety-net rules still resolve it) |
+| `tool_name`, `tool_input` | Kept in full |
+| `suggestions` | Raw `permission_suggestions`, sent back verbatim when chosen |
+| `conn` | The hook's connection; closing it removes the approval |
+
+**`needs_approval` is derived, never stored.** A session needs approval iff it has at least one open approval; `overall` is derived from sessions. State and queue cannot disagree.
+
+### Transitions
+
+| Event | Effect |
+|---|---|
+| `SessionStart` | Create session, `idle` |
+| `UserPromptSubmit` | `working`; clear activity; close open approvals (safety net) |
+| `PreToolUse` | `working`; set activity; remember for pairing |
+| `PostToolUse` | `working`; clear activity; close the approval paired with this `tool_use_id` |
+| `PermissionRequest` | Pair with a remembered `PreToolUse` (same session, tool name, input); add approval |
+| `Notification` `idle_prompt` | `needs_input` |
+| `Notification` `permission_prompt` | Ignored |
+| `Stop` | `done`; clear activity; close open approvals (safety net) |
+| `SessionEnd` | Remove session |
+| Any event with `agent_id` | Only updates `last_event_at`; never changes state. Its `PreToolUse` is still remembered for pairing in case a subagent asks for permission. |
+
+"Close an approval" means: remove it and close the hook connection without a decision (the hook exits silently).
+
+**Labels:** basename of `cwd`. If two sessions share it, use `parent/base` (`work/api`, `personal/api`); if they share the directory, append a short id (`api #3f2a`).
+
+### Session expiry
+
+The experiment showed `SessionEnd` doesn't always fire. Primary mechanism: **watch the `claude` process.** The hook sends its parent PID (the `claude` process, since exec-form hooks have no shell in between). The daemon opens a `pidfd` for it (`pidfd_open(2)`, Linux 5.3+, reachable from the Go stdlib via a raw syscall) and polls it in the event loop; it becomes readable when the process exits, and the session is removed immediately, crashes included. No polling timers.
+
+Fallback: remove a session after 30 minutes with no events and no open approvals (covers PID lookup failures, PID namespaces, unusual launchers).
+
+**Verify:** that the hook's parent PID is the long-lived `claude` process for exec-form hooks (our probe ran through bash; nod won't).
+
+### Snapshot (what frontends receive)
+
+```json
+{
+  "v": 1,
+  "overall": "needs_approval",
+  "sessions": [
+    {
+      "id": "5471d4ed-…",
+      "label": "scratch",
+      "state": "needs_approval",
+      "activity": {"tool": "Bash", "summary": "touch probe2.txt"},
+      "mode": "default",
+      "since": 1759600009000,
+      "approvals": [
+        {
+          "id": "9f3c…",
+          "tool": "Bash",
+          "summary": "touch probe2.txt",
+          "detail": "touch probe2.txt",
+          "options": [
+            {"id": "allow", "label": "Allow"},
+            {"id": "s0",    "label": "Allow, and don't ask again for files in scratch/ (this session)"},
+            {"id": "s1",    "label": "Allow, and accept all edits (this session)"},
+            {"id": "deny",  "label": "Deny"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+- **The daemon sorts sessions:** most urgent first, then oldest pending approval, then most recent activity. Frontends show `sessions[0]`; arrows step through the list.
+- **Options are a daemon-built list.** Frontends send back only `(approval id, option id)`. New suggestion types need no frontend change.
+- **`summary` is short; `detail` is never truncated.** You always see the whole command before you can allow it.
+- Raw payloads, connections and the pairing buffer never leave the daemon.
+- Consumers ignore unknown fields; adding fields doesn't bump `v`.
+
+Open (steps 7 and 8): how `detail` presents large `Write`/`Edit` content (path + scrollable full view vs. diff preview).
+
+---
+
 ## Pending CLAUDE.md updates
 
 Confirmed by the experiment; apply when we next touch CLAUDE.md:
@@ -162,5 +307,7 @@ Confirmed by the experiment; apply when we next touch CLAUDE.md:
 - "Hook ↔ daemon": the daemon may close a waiting `PermissionRequest` connection without a decision.
 - "Environment": GNOME Shell 50.1, Go 1.27.1, distro.
 - Architecture: note that the D-Bus API is desktop-neutral and other frontends are expected; systemd is optional.
+- Architecture: the CLI is a D-Bus client; milestones 2 and 3 merge. nod never auto-decides; no persisted state; the hook never starts the daemon.
 - Decision set: `allow`, `deny` + message, `allow` + `updatedPermissions` from suggestions (structured objects, not strings).
-- "Session state": `Stop`/`idle_prompt` must clear dangling `PreToolUse` activity; events with `agent_id` don't change the main session's state on their own.
+- "Session state": replace the table and expiry note with section 4 (derived `needs_approval`, `agent_id` rule, pidfd expiry with 30 min fallback).
+- "Session state" (old note): `Stop`/`idle_prompt` must clear dangling `PreToolUse` activity; events with `agent_id` don't change the main session's state on their own.
